@@ -1,0 +1,19 @@
+[package]
+name = "apocaholics-anonymous"
+version = "0.1.0"
+authors = ["Michał Sidor (Michcioperz) <public+git@meekchopp.es>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web = "3.1.0"
+better-panic = "0.2.0"
+pretty_env_logger = "0.4.0"
+deadpool-postgres = "0.5.6"
+tokio-postgres = "0.5.5"
+serde = { version = "1.0.117", features = ["derive"] }
+config = "0.10.1"
+thiserror = "1.0.21"
+sentry = "0.20.1"
+chrono = "0.4.19"
