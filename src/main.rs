@@ -64,10 +64,15 @@ fn authorize_user(user: &str) -> Result<(), MyBad> {
 }
 
 #[derive(Debug, Deserialize)]
-struct IngestData {
-    user: String,
+struct IngestElem {
     key: String,
     value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IngestData {
+    user: String,
+    data: Vec<IngestElem>,
 }
 
 #[post("/api/v1/ingest")]
@@ -75,7 +80,10 @@ async fn ingest(data: Json<IngestData>, db_pool: Data<Pool>) -> Result<HttpRespo
     let data = data.into_inner();
     authorize_user(&data.user)?;
     let client = db_pool.get().await.map_err::<MyBad, _>(Into::into)?;
-    client.execute("INSERT INTO apocalypse (username, key, value, stamp) VALUES ($1, $2, $3, NOW()) ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value, stamp = EXCLUDED.stamp", &[&data.user, &data.key, &data.value]).await.map_err::<MyBad, _>(Into::into)?;
+    let stmt = client.prepare("INSERT INTO apocalypse (username, key, value, stamp) VALUES ($1, $2, $3, NOW()) ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value, stamp = EXCLUDED.stamp").await.map_err::<MyBad, _>(Into::into)?;
+    for elem in data.data {
+        client.execute(&stmt, &[&data.user, &elem.key, &elem.value]).await.map_err::<MyBad, _>(Into::into)?;
+    }
     Ok(HttpResponse::Created().json(()))
 }
 
