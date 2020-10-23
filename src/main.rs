@@ -5,10 +5,19 @@ use actix_web::{
 };
 use deadpool_postgres::Pool;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use hmac::{Hmac, Mac, NewMac};
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Deserialize)]
 struct HttpConfig {
     address: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct AuthConfig {
+    magic_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -20,6 +29,7 @@ struct SentryConfig {
 struct Config {
     pg: deadpool_postgres::Config,
     http: HttpConfig,
+    auth: Option<AuthConfig>,
     sentry: Option<SentryConfig>,
 }
 
@@ -39,7 +49,8 @@ enum MyBad {
     #[error("database failure")]
     DatabaseFailure(#[from] tokio_postgres::Error),
     #[error("provided user is not authorized in this session. ask for genuine sio2 software")]
-    Unauthorized,
+    //Unauthorized(#[from] hmac::crypto_mac::MacError)
+    Unauthorized()
 }
 
 impl actix_web::ResponseError for MyBad {
@@ -48,19 +59,29 @@ impl actix_web::ResponseError for MyBad {
             MyBad::DatabaseFailure(_) | MyBad::DatabasePoolFailure(_) => {
                 HttpResponse::InternalServerError().body(format!("{}", self))
             }
-            MyBad::Unauthorized => HttpResponse::Forbidden().body(format!("{}", self)),
+            MyBad::Unauthorized() => HttpResponse::Forbidden().body(format!("{}", self)),
         }
     }
 }
+
+type AppCtx = (Pool, Option<AuthConfig>);
 
 #[get("/")]
 async fn hello() -> impl Responder {
     HttpResponse::Ok().body("apocaholics anonymous v0.1.0")
 }
 
-fn authorize_user(user: &str) -> Result<(), MyBad> {
-    // TODO!!!
-    Ok(())
+fn authorize_user(cfg: &Option<AuthConfig>, token: &str) -> Result<String, MyBad> {
+    let mut parts = token.splitn(2, ':');
+    let user = parts.next().expect("splitn produced empty iterator");
+    if let Some(cfg) = cfg {
+        let sig = parts.next().ok_or( MyBad::Unauthorized())?;
+        let sig = base64::decode_config(sig, base64::URL_SAFE).map_err(|_| MyBad::Unauthorized())?;
+        let mut mac = HmacSha256::new_varkey(cfg.magic_key.as_bytes()).expect("HMAC didn't like key size");
+        mac.update(user.as_bytes());
+        mac.verify(&sig).map_err(|_|  MyBad::Unauthorized())?;
+    };
+    Ok(user.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,14 +97,15 @@ struct IngestData {
 }
 
 #[post("/api/v1/ingest")]
-async fn ingest(data: Json<IngestData>, db_pool: Data<Pool>) -> Result<HttpResponse, MyBad> {
+async fn ingest(data: Json<IngestData>, ctx: Data<AppCtx>) -> Result<HttpResponse, MyBad> {
     let data = data.into_inner();
-    authorize_user(&data.user)?;
+    let (db_pool, authcfg) = ctx.get_ref();
+    let user = authorize_user(authcfg, &data.user)?;
     let mut client = db_pool.get().await.map_err::<MyBad, _>(Into::into)?;
     let client = client.transaction().await.map_err::<MyBad, _>(Into::into)?;
     let stmt = client.prepare("INSERT INTO apocalypse (username, key, value, stamp) VALUES ($1, $2, $3, NOW()) ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value, stamp = EXCLUDED.stamp").await.map_err::<MyBad, _>(Into::into)?;
     for elem in data.data {
-        client.execute(&stmt, &[&data.user, &elem.key, &elem.value]).await.map_err::<MyBad, _>(Into::into)?;
+        client.execute(&stmt, &[&user, &elem.key, &elem.value]).await.map_err::<MyBad, _>(Into::into)?;
     }
     client.commit().await.map_err::<MyBad, _>(Into::into)?;
     Ok(HttpResponse::Created().json(()))
@@ -97,13 +119,14 @@ struct DumpData {
 }
 
 #[get("/api/v1/dump/{username}")]
-async fn dump(username: Path<String>, db_pool: Data<Pool>) -> Result<HttpResponse, MyBad> {
-    authorize_user(&username.0)?;
+async fn dump(username: Path<String>, ctx: Data<AppCtx>) -> Result<HttpResponse, MyBad> {
+    let (db_pool, authcfg) = ctx.get_ref();
+    let user = authorize_user(authcfg, &username.0)?;
     let client = db_pool.get().await.map_err::<MyBad, _>(Into::into)?;
     let data: Vec<DumpData> = client
         .query(
             "SELECT key, value, stamp::TEXT FROM apocalypse WHERE username = $1",
-            &[&username.0],
+            &[&user],
         )
         .await
         .map_err::<MyBad, _>(Into::into)?
@@ -136,9 +159,11 @@ async fn main() -> std::io::Result<()> {
         let _test_client = pool.get().await.expect("database pool self-test failed");
     }
 
+    let authcfg = cfg.auth;
+
     actix_web::HttpServer::new(move || {
         actix_web::App::new()
-            .data(pool.clone())
+            .data((pool.clone(), authcfg.clone()))
             .service(hello)
             .service(ingest)
             .service(dump)

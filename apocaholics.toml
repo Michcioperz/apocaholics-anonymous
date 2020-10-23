@@ -4,3 +4,6 @@ dbname = "apocaholics"
 
 [http]
 address = "0.0.0.0:4040"
+
+[auth]
+magic_key = "alamakota"
