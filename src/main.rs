@@ -4,9 +4,9 @@ use actix_web::{
     HttpResponse, Responder,
 };
 use deadpool_postgres::Pool;
+use hmac::{Hmac, Mac, NewMac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use hmac::{Hmac, Mac, NewMac};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -49,8 +49,13 @@ enum MyBad {
     #[error("database failure")]
     DatabaseFailure(#[from] tokio_postgres::Error),
     #[error("provided user is not authorized in this session. ask for genuine sio2 software")]
-    //Unauthorized(#[from] hmac::crypto_mac::MacError)
-    Unauthorized()
+    Unauthorized,
+}
+
+impl From<hmac::crypto_mac::MacError> for MyBad {
+    fn from(_: hmac::crypto_mac::MacError) -> Self {
+        Self::Unauthorized
+    }
 }
 
 impl actix_web::ResponseError for MyBad {
@@ -59,7 +64,7 @@ impl actix_web::ResponseError for MyBad {
             MyBad::DatabaseFailure(_) | MyBad::DatabasePoolFailure(_) => {
                 HttpResponse::InternalServerError().body(format!("{}", self))
             }
-            MyBad::Unauthorized() => HttpResponse::Forbidden().body(format!("{}", self)),
+            MyBad::Unauthorized => HttpResponse::Forbidden().body(format!("{}", self)),
         }
     }
 }
@@ -75,11 +80,12 @@ fn authorize_user(cfg: &Option<AuthConfig>, token: &str) -> Result<String, MyBad
     let mut parts = token.splitn(2, ':');
     let user = parts.next().expect("splitn produced empty iterator");
     if let Some(cfg) = cfg {
-        let sig = parts.next().ok_or( MyBad::Unauthorized())?;
-        let sig = base64::decode_config(sig, base64::URL_SAFE).map_err(|_| MyBad::Unauthorized())?;
-        let mut mac = HmacSha256::new_varkey(cfg.magic_key.as_bytes()).expect("HMAC didn't like key size");
+        let sig = parts.next().ok_or(MyBad::Unauthorized)?;
+        let sig = base64::decode_config(sig, base64::URL_SAFE).map_err(|_| MyBad::Unauthorized)?;
+        let mut mac =
+            HmacSha256::new_varkey(cfg.magic_key.as_bytes()).expect("HMAC didn't like key size");
         mac.update(user.as_bytes());
-        mac.verify(&sig).map_err(|_|  MyBad::Unauthorized())?;
+        mac.verify(&sig)?;
     };
     Ok(user.to_string())
 }
@@ -105,7 +111,10 @@ async fn ingest(data: Json<IngestData>, ctx: Data<AppCtx>) -> Result<HttpRespons
     let client = client.transaction().await.map_err::<MyBad, _>(Into::into)?;
     let stmt = client.prepare("INSERT INTO apocalypse (username, key, value, stamp) VALUES ($1, $2, $3, NOW()) ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value, stamp = EXCLUDED.stamp").await.map_err::<MyBad, _>(Into::into)?;
     for elem in data.data {
-        client.execute(&stmt, &[&user, &elem.key, &elem.value]).await.map_err::<MyBad, _>(Into::into)?;
+        client
+            .execute(&stmt, &[&user, &elem.key, &elem.value])
+            .await
+            .map_err::<MyBad, _>(Into::into)?;
     }
     client.commit().await.map_err::<MyBad, _>(Into::into)?;
     Ok(HttpResponse::Created().json(()))
