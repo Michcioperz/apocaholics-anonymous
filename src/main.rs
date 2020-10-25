@@ -107,16 +107,15 @@ async fn ingest(data: Json<IngestData>, ctx: Data<AppCtx>) -> Result<HttpRespons
     let data = data.into_inner();
     let (db_pool, authcfg) = ctx.get_ref();
     let user = authorize_user(authcfg, &data.user)?;
-    let mut client = db_pool.get().await.map_err::<MyBad, _>(Into::into)?;
-    let client = client.transaction().await.map_err::<MyBad, _>(Into::into)?;
-    let stmt = client.prepare("INSERT INTO apocalypse (username, key, value, stamp) VALUES ($1, $2, $3, NOW()) ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value, stamp = EXCLUDED.stamp").await.map_err::<MyBad, _>(Into::into)?;
+    let mut client = db_pool.get().await?;
+    let client = client.transaction().await?;
+    let stmt = client.prepare("INSERT INTO apocalypse (username, key, value, stamp) VALUES ($1, $2, $3, NOW()) ON CONFLICT (username, key) DO UPDATE SET value = EXCLUDED.value, stamp = EXCLUDED.stamp").await?;
     for elem in data.data {
         client
             .execute(&stmt, &[&user, &elem.key, &elem.value])
-            .await
-            .map_err::<MyBad, _>(Into::into)?;
+            .await?;
     }
-    client.commit().await.map_err::<MyBad, _>(Into::into)?;
+    client.commit().await?;
     Ok(HttpResponse::Created().json(()))
 }
 
@@ -131,14 +130,13 @@ struct DumpData {
 async fn dump(username: Path<String>, ctx: Data<AppCtx>) -> Result<HttpResponse, MyBad> {
     let (db_pool, authcfg) = ctx.get_ref();
     let user = authorize_user(authcfg, &username.0)?;
-    let client = db_pool.get().await.map_err::<MyBad, _>(Into::into)?;
+    let client = db_pool.get().await?;
     let data: Vec<DumpData> = client
         .query(
             "SELECT key, value, stamp::TEXT FROM apocalypse WHERE username = $1",
             &[&user],
         )
-        .await
-        .map_err::<MyBad, _>(Into::into)?
+        .await?
         .into_iter()
         .map(|row| DumpData {
             key: row.get(0),
